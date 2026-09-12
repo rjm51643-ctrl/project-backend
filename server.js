@@ -16,13 +16,14 @@ const RENTCAST_API_KEY = process.env.RENTCAST_API_KEY;
 const PORT = process.env.PORT || 3000;
 
 // ---- simple in-memory cache (swap for Redis/Postgres once this needs to survive restarts) ----
-const CACHE_TTL_MS = 1000 * 60 * 60 * 24; // 24 hours — comps don't move minute to minute
+const AVM_CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 3;       // 3 days — comps shift somewhat over time
+const RECORD_CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 180;  // 180 days — tax/sale/HOA records barely change
 const cache = new Map();
 
-function getCached(key) {
+function getCached(key, ttl) {
   const hit = cache.get(key);
   if (!hit) return null;
-  if (Date.now() - hit.timestamp > CACHE_TTL_MS) { cache.delete(key); return null; }
+  if (Date.now() - hit.timestamp > ttl) { cache.delete(key); return null; }
   return hit.data;
 }
 function setCached(key, data) {
@@ -126,41 +127,56 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 app.get('/api/lookup', async (req, res) => {
   const address = (req.query.address || '').trim();
-  const propertyType = (req.query.propertyType || '').trim(); // RentCast enum, e.g. "Multi-Family"
+  const propertyType = (req.query.propertyType || '').trim();
   const squareFootage = req.query.squareFootage ? Number(req.query.squareFootage) : null;
   const units = req.query.units ? Number(req.query.units) : 1;
 
   if (!address) return res.status(400).json({ error: 'address query param is required' });
 
-  const cacheKey = [address.toLowerCase(), propertyType, squareFootage, units].join('|');
-  const cached = getCached(cacheKey);
-  if (cached) return res.json({ ...cached, cached: true });
+  const avmKey = ['avm', address.toLowerCase(), propertyType, squareFootage, units].join('|');
+  const recordKey = ['record', address.toLowerCase()].join('|');
 
-  const extraParams = {};
-  if (propertyType) extraParams.propertyType = propertyType;
-  if (squareFootage) extraParams.squareFootage = squareFootage;
+  let avmResult = getCached(avmKey, AVM_CACHE_TTL_MS);
+  let avmCached = !!avmResult;
+  if (!avmResult) {
+    const extraParams = {};
+    if (propertyType) extraParams.propertyType = propertyType;
+    if (squareFootage) extraParams.squareFootage = squareFootage;
+    const [valueRes, rentRes] = await Promise.allSettled([
+      fetchRentcast('avm/value', address, extraParams),
+      fetchRentcast('avm/rent/long-term', address, extraParams)
+    ]);
+    avmResult = {
+      value: valueRes.status === 'fulfilled' ? shapeEstimate(valueRes.value, false, units) : null,
+      rent: rentRes.status === 'fulfilled' ? shapeEstimate(rentRes.value, true, units) : null,
+      errors: {
+        value: valueRes.status === 'rejected' ? valueRes.reason.message : null,
+        rent: rentRes.status === 'rejected' ? rentRes.reason.message : null
+      }
+    };
+    if (avmResult.value || avmResult.rent) setCached(avmKey, avmResult);
+  }
 
-  const [valueRes, rentRes, recordRes] = await Promise.allSettled([
-    fetchRentcast('avm/value', address, extraParams),
-    fetchRentcast('avm/rent/long-term', address, extraParams),
-    fetchRentcastPropertyRecord(address)
-  ]);
-
-  const result = {
-    address,
-    cached: false,
-    value: valueRes.status === 'fulfilled' ? shapeEstimate(valueRes.value, false, units) : null,
-    rent: rentRes.status === 'fulfilled' ? shapeEstimate(rentRes.value, true, units) : null,
-    record: recordRes.status === 'fulfilled' ? shapePropertyRecord(recordRes.value) : null,
-    errors: {
-      value: valueRes.status === 'rejected' ? valueRes.reason.message : null,
-      rent: rentRes.status === 'rejected' ? rentRes.reason.message : null,
-      record: recordRes.status === 'rejected' ? recordRes.reason.message : null
+  let recordResult = getCached(recordKey, RECORD_CACHE_TTL_MS);
+  let recordCached = !!recordResult;
+  if (!recordResult) {
+    try {
+      const raw = await fetchRentcastPropertyRecord(address);
+      recordResult = { record: shapePropertyRecord(raw), errors: { record: null } };
+    } catch (err) {
+      recordResult = { record: null, errors: { record: err.message } };
     }
-  };
+    if (recordResult.record) setCached(recordKey, recordResult);
+  }
 
-  if (result.value || result.rent || result.record) setCached(cacheKey, result);
-  res.json(result);
+  res.json({
+    address,
+    cached: avmCached && recordCached,
+    value: avmResult.value,
+    rent: avmResult.rent,
+    record: recordResult.record,
+    errors: { ...avmResult.errors, ...recordResult.errors }
+  });
 });
 
 app.listen(PORT, () => console.log(`Plumbline backend listening on port ${PORT}`));
