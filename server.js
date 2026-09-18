@@ -38,6 +38,7 @@ function rateLimit(req, res, next) {
 }
 
 const RENTCAST_API_KEY = process.env.RENTCAST_API_KEY;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const PORT = process.env.PORT || 3000;
 
 // ---- simple in-memory cache (swap for Redis/Postgres once this needs to survive restarts) ----
@@ -101,7 +102,8 @@ function shapePropertyRecord(record) {
     lastSaleDate: record.lastSaleDate ?? null,
     annualPropertyTax,
     hoaFeeMonthly: record.hoa && record.hoa.fee ? record.hoa.fee : null,
-    countyUnitCount: record.features && record.features.unitCount ? record.features.unitCount : null
+    countyUnitCount: record.features && record.features.unitCount ? record.features.unitCount : null,
+    squareFootage: record.squareFootage ?? (record.features && record.features.squareFootage) ?? null
   };
 }
 
@@ -149,6 +151,36 @@ function shapeEstimate(raw, isRent, unitCount) {
 
 // ---- routes ----
 app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+// Server-side AI text generation — uses YOUR Anthropic API key, never exposed to the browser.
+// Works from any hosted domain, unlike calling api.anthropic.com directly from client-side code
+// (that only works inside Claude's own chat preview, not on a real public site).
+app.post('/api/ai-summary', rateLimit, async (req, res) => {
+  const { prompt } = req.body || {};
+  if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'prompt is required' });
+  if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'Server is missing ANTHROPIC_API_KEY' });
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001', // fast and cheap — right-sized for a short teaser paragraph
+        max_tokens: 500,
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+    const data = await r.json();
+    if (!r.ok) return res.status(502).json({ error: data.error?.message || 'Anthropic API request failed' });
+    const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+    res.json({ text });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
 
 // ---- waitlist capture (for the free Health Score landing page) ----
 const waitlist = []; // swap for a real database before you have meaningful volume — this resets on redeploy
