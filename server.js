@@ -7,10 +7,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const cron = require('node-cron');
 
-const RESEND_API_KEY = process.env.RESEND_API_KEY;
-const ALERT_FROM_EMAIL = process.env.ALERT_FROM_EMAIL || 'Plumbline Alerts <onboarding@resend.dev>';
 function num(v){ const n = parseFloat(v); return isNaN(n) ? 0 : n; }
 
 const app = express();
@@ -150,116 +147,8 @@ function shapeEstimate(raw, isRent, unitCount) {
   };
 }
 
-// ---- ALERTS: subscriptions and evaluation ----
-// Stored in memory for now — swap for a real database before relying on this for real users,
-// same caveat as the waitlist above.
-const alertSubscriptions = new Map(); // email -> { properties: [...], lastKnownState: { [propertyId]: {...} } }
-
-function monthlyDebtServiceCalc(loanAmount, aprPct, termYears){
-  if(!loanAmount || loanAmount <= 0) return 0;
-  const r = (aprPct/100)/12;
-  const n = termYears*12;
-  if(r === 0) return loanAmount/n;
-  return loanAmount * (r*Math.pow(1+r,n)) / (Math.pow(1+r,n)-1);
-}
-function evaluatePropertyFinancials(p){
-  const monthlyExpenses = num(p.monthlyTaxes)+num(p.monthlyInsurance)+num(p.monthlyMaintenance)+num(p.monthlyMgmtFee)+num(p.monthlyOtherExpenses);
-  const noi = (num(p.monthlyRentActual)*12) - (monthlyExpenses*12);
-  const annualDebt = monthlyDebtServiceCalc(num(p.loanAmount), num(p.interestRatePct), num(p.loanTermYears)||30) * 12;
-  const dscr = annualDebt > 0 ? noi/annualDebt : null;
-  return { noi, dscr, cashFlow: noi - annualDebt };
-}
-
-async function evaluateAlertsForProperty(p, lastKnown){
-  const alerts = [];
-  try{
-    const rcType = (p.type === 'Duplex' || p.type === 'Small multifamily') ? 'Multi-Family' : (p.type === 'Single-family' ? 'Single Family' : '');
-    const extraParams = rcType ? { propertyType: rcType } : {};
-    const rentRaw = await fetchRentcast('avm/rent/long-term', p.address, extraParams);
-    const shaped = shapeEstimate(rentRaw, true, p.units || 1);
-    if(shaped && shaped.confidence !== null && shaped.confidence >= 35){
-      const gap = shaped.estimate - num(p.monthlyRentActual);
-      if(gap > 50){
-        alerts.push(`Rent may be under market by about $${Math.round(gap)}/mo at ${p.address}.`);
-      }
-      if(lastKnown.confidence !== undefined && shaped.confidence - lastKnown.confidence >= 20){
-        alerts.push(`Market data confidence for ${p.address} improved to ${shaped.confidence}/100 (was ${lastKnown.confidence}) — worth revisiting this estimate.`);
-      }
-      lastKnown.marketRent = shaped.estimate;
-      lastKnown.confidence = shaped.confidence;
-    }
-  }catch(e){ /* one property's data hiccup shouldn't block the rest of the check */ }
-
-  const fin = evaluatePropertyFinancials(p);
-  if(fin.dscr !== null && fin.dscr < 1.2){
-    alerts.push(`DSCR at ${p.address} is ${fin.dscr.toFixed(2)}x, below the 1.2x lenders typically want.`);
-  }
-  if(p.leaseExpiration){
-    const days = (new Date(p.leaseExpiration) - new Date()) / 86400000;
-    if(days >= 0 && days <= 30){
-      alerts.push(`Lease at ${p.address} expires in ${Math.round(days)} days.`);
-    }
-  }
-  return alerts;
-}
-
-async function sendAlertEmail(toEmail, alerts){
-  if(!RESEND_API_KEY){
-    console.log(`[alerts] RESEND_API_KEY not set — would have emailed ${toEmail}:`, alerts);
-    return false;
-  }
-  const html = `<p>Here's what needs attention in your Plumbline portfolio:</p><ul>${alerts.map(a => `<li>${a}</li>`).join('')}</ul>`;
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ from: ALERT_FROM_EMAIL, to: toEmail, subject: 'Plumbline: portfolio alerts', html })
-  });
-  return res.ok;
-}
-
 // ---- routes ----
 app.get('/api/health', (req, res) => res.json({ ok: true }));
-
-app.post('/api/alerts/subscribe', (req, res) => {
-  const { email, properties } = req.body || {};
-  if(!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'A valid email is required' });
-  if(!Array.isArray(properties)) return res.status(400).json({ error: 'properties must be an array' });
-  const existing = alertSubscriptions.get(email);
-  alertSubscriptions.set(email, { properties, lastKnownState: existing ? existing.lastKnownState : {} });
-  res.json({ ok: true, propertyCount: properties.length });
-});
-
-app.post('/api/alerts/check-now', async (req, res) => {
-  const { email } = req.body || {};
-  const sub = alertSubscriptions.get(email);
-  if(!sub) return res.status(404).json({ error: 'No subscription found for that email — enable alerts first.' });
-  const allAlerts = [];
-  for(const p of sub.properties){
-    const lastKnown = sub.lastKnownState[p.id] || (sub.lastKnownState[p.id] = {});
-    const alerts = await evaluateAlertsForProperty(p, lastKnown);
-    allAlerts.push(...alerts);
-  }
-  let emailSent = false;
-  if(allAlerts.length){ emailSent = await sendAlertEmail(email, allAlerts); }
-  res.json({ ok: true, alertCount: allAlerts.length, alerts: allAlerts, emailSent });
-});
-
-// Daily check for every subscribed email — runs at 13:00 UTC (~8am ET) regardless of whether anyone has the dashboard open.
-cron.schedule('0 13 * * *', async () => {
-  for(const [email, sub] of alertSubscriptions.entries()){
-    const allAlerts = [];
-    for(const p of sub.properties){
-      const lastKnown = sub.lastKnownState[p.id] || (sub.lastKnownState[p.id] = {});
-      try{
-        allAlerts.push(...(await evaluateAlertsForProperty(p, lastKnown)));
-      }catch(e){ console.error('[alerts] check failed for', p.address, e.message); }
-    }
-    if(allAlerts.length){
-      try{ await sendAlertEmail(email, allAlerts); }
-      catch(e){ console.error('[alerts] email send failed for', email, e.message); }
-    }
-  }
-});
 
 // ---- waitlist capture (for the free Health Score landing page) ----
 const waitlist = []; // swap for a real database before you have meaningful volume — this resets on redeploy
